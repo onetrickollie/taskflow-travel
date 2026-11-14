@@ -1,0 +1,491 @@
+\documentclass{article}
+
+% CSCI 566 midterm report. ICML 2026 two-column format, matching the
+% pre-proposal. Course instructions override conference defaults: author
+% names must be visible -> preprint option. Numeric citations to match the
+% pre-proposal's [1], [2] style.
+\PassOptionsToPackage{numbers,compress}{natbib}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[preprint]{icml2026}
+
+% Course report: restore numeric citations [1], [2] to match the
+% pre-proposal (the stock style forces author-year at its line 551).
+\setcitestyle{numbers,square,citesep={,}}
+
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{array}
+
+\icmltitlerunning{TaskFlow-Travel: Midterm Report}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{TaskFlow-Travel: Imitation-Learned Coordination for Multi-Agent
+    Travel Replanning under Evolving User Constraints\\
+    \large Midterm Progress Report}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Chenhao Liang}{}
+    \icmlauthor{Chenshuhao Qin}{}
+    \icmlauthor{Kaixiang Liu}{}
+    \icmlauthor{Yusong Liu}{}
+    \icmlauthor{Zhuyu Lu}{}
+    \icmlauthor{Guangyu Hou}{}
+    \icmlauthor{Chengfeng Tang}{}
+    \par\smallskip
+    {\normalsize University of Southern California}
+  \end{icmlauthorlist}
+
+  \icmlkeywords{multi-agent systems, imitation learning, language agents, replanning}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+TaskFlow-Travel studies how a travel-planning agent should respond when the
+user keeps changing their mind: adding, deleting, replacing, or reprioritizing
+constraints over multiple turns. Rather than regenerating the whole itinerary
+after every update, a \emph{coordinator} decides whether to keep the plan, ask
+for clarification, refresh a search, repair one component (transport,
+accommodation, meals, attractions), or rebuild globally. We train this
+coordinator---a small MLP over non-privileged state features---by behavior
+cloning, trajectory augmentation, and DAgger from a privileged scripted
+expert, and compare it against always-regenerate and two rule-based
+coordinators. At midterm we have a leakage-safe evolving-constraint benchmark
+derived from TravelPlanner (1{,}420 episodes over 355 queries, plus a
+multi-component budget-cut family), a full multi-turn planning environment
+with verifier, agents, and coordinators, a committed model zoo (18 models, 3
+seeds), and a complete offline evaluation. The learned coordinator matches
+the expert's 99.6--100\% revision success with 14\% fewer LLM calls than the
+strongest static baseline, is the only method family above 97\% when capped at
+one LLM call per turn (rules: 72--80\%), and makes about 20\% fewer excess
+edits on multi-component budget cuts. Both concerns raised by the
+pre-proposal review are now first-class: cascading imitation error is
+addressed with augmentation and DAgger and measured with forced-mistake
+recovery (99.1--100\% with augmentation), and a public release of the dataset
+and verifier is scheduled with the final report.
+\end{abstract}
+
+\section{Progress so far}
+\label{sec:progress}
+
+\subsection{Task recap}
+Travel planning is rarely a one-shot request. After seeing an itinerary, a
+user may lower the budget, require a hotel that allows pets, drop a cuisine,
+or decide that convenience matters more than price. Current LLM agents
+respond fluently but often forget earlier constraints or regenerate
+unaffected parts of the plan
+\citep{xie2024travelplanner,oh2025flextravelplanner}. As proposed in our
+pre-proposal, TaskFlow-Travel treats each revision as a coordination
+decision: after every update, a coordinator chooses among twelve actions
+(\textsc{KeepPlan}, \textsc{AskClarification}, three \textsc{Search} actions,
+five \textsc{ReplanLocal}/\textsc{ReplanGlobal} actions, \textsc{Verify},
+\textsc{Stop}). The research question is whether this coordination policy can
+be \emph{learned by imitation} rather than hand-written, and whether it saves
+unnecessary replanning and LLM calls at equal success. A plan is a 13-slot
+structure (2 transport legs, 1 stay, 6 meals, 4 attractions); ``do the
+minimum'' means changing as few slots as any valid repair requires.
+
+\subsection{What has been built}
+All components below are implemented, tested (94 offline tests), and
+reproducible: datasets rebuild byte-for-byte from a fixed seed and all 18
+models retrain to identical weights.
+
+\textbf{Benchmark and verifier.} We parse TravelPlanner's per-query database
+slices (flights, ground transport, hotels, restaurants, attractions) and
+verify plans with TravelPlanner-style commonsense and hard constraints, plus
+our rating floor and cost/quality priority. All 3{,}054 passing expert plans
+pass the adapted upstream checks. Queries are split
+train/validation/test \emph{before} generating update variants, so no trip
+variant crosses splits: 355 three-day single-city queries (215/71/69) expand
+into 1{,}420 episodes of 1--4 updates from four types (add, delete, replace,
+reprioritize) over seven constraint targets (budget, room type, house rule,
+cuisine, transport rule, restaurant rating floor, cost/quality priority).
+About 19\% of test turns are infeasible---the correct response is to ask---
+and 63\% of feasible updates invalidate the plan the coordinator would
+otherwise keep (generator target 75\%). The test split is held out three
+ways: unseen trips, a second phrasing template set, and 4-turn chains
+(training uses at most 3). A one-turn multi-component family (budget cuts
+needing 0--3 component changes, 138 test episodes) and a 12-case stress suite
+complete the task suite; all 3{,}667 feasibility labels agree with an
+independent exact solver.
+
+\textbf{Multi-turn environment and agents.} A rule-based constraint tracker
+converts each user message to a structured diff (an LLM tracker with schema
+validation and fallback is implemented behind a provider switch).
+Deterministic component planners implement local repair (other components
+frozen) and global regeneration; LLM-backed variants choose from validated
+shortlists. Cached searches go stale when a relevant constraint changes; the
+system acts on its own constraint belief, with ground truth used only for
+scoring.
+
+\textbf{Coordinators.} Five exist: always-regenerate (plus a deterministic
+control), static rules, a \emph{cost-aware} static baseline added after
+review (repair components in order of potential savings, ask when even the
+cheapest options break the budget), a privileged scripted expert that
+searches repairs of up to three components, and an LLM coordinator that
+doubles as the DAgger teacher.
+
+\textbf{Learned coordinator.} An MLP over ${\sim}96$ non-privileged
+features, trained with behavior cloning (BC), trajectory augmentation, and
+DAgger (1--3 iterations), 3 seeds each; 18 models are committed.
+
+\textbf{Evaluation and demos.} All proposal metrics (final pass, revision
+success, constraint retention, preservation, LLM/tool calls), an exact
+minimum-edit oracle, budget-capped comparisons, forced-mistake recovery,
+per-type/turn/level breakdowns, and figures. An interactive web app plans a
+trip between any two of the benchmark's cities and revises it in plain
+language, showing all four coordinators side by side.
+
+\subsection{Progress against the pre-proposal}
+Table~\ref{tab:vsproposal} maps the promised plan to current status. The two
+promised baselines exist (one in two strengths); the learned system is
+trained. The deviations are honest gaps, addressed in
+Section~\ref{sec:plan}: every LLM component has only been exercised with an
+offline stand-in backend, the single-agent baseline is not yet built, and
+FlexTravelBench is not yet integrated (its license is being checked).
+
+\textbf{Response to the pre-proposal review.} The review raised two points,
+and both shaped the work so far. First, it flagged \emph{cascading trajectory
+error} (distribution shift) as the key technical risk of behavior cloning
+for agent coordination, and recommended DAgger or trajectory augmentation
+during dataset construction rather than relying solely on offline teacher
+cloning. We implemented both: trajectories are augmented with
+near-miss and perturbed states, and DAgger iterations re-label the learner's
+own states with the expert. Section~\ref{sec:results} measures the concern
+directly: forced-mistake recovery rises from 90.5--95.9\% (plain BC) to
+99.1--100\% with augmentation. Second, the review asked for a public release
+of the evolving-constraint dataset and verifier as a community benchmark.
+The artifacts are built for release (committed data with manifests, exact
+solver, upstream-compatible checks; TravelPlanner data is CC BY 4.0), and
+the release package is scheduled before the final report
+(Section~\ref{sec:plan}).
+
+\begin{table*}[t]
+\centering
+\caption{Pre-proposal commitments vs.\ status at midterm.}
+\label{tab:vsproposal}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.34\textwidth}>{\raggedright\arraybackslash}p{0.58\textwidth}@{}}
+\toprule
+\textbf{Pre-proposal item} & \textbf{Status at midterm} \\
+\midrule
+Constraint taxonomy, verifier, leakage-safe splits &
+Done; upstream-compatible checks; exact-solver-validated labels \\
+Single-agent LLM baseline & Not started (P0; Section~\ref{sec:plan}) \\
+Static multi-agent baseline & Done, in two strengths (rules; cost-aware) \\
+Learned coordinator (BC) & Done; extended with augmentation and DAgger \\
+Real-LLM tracker/agents/coordinator & Implemented and offline-tested; not
+yet run against a real model (P0) \\
+Evolving-constraint tasks from TravelPlanner & Done (v0 $+$ multi-component
+family) \\
+FlexTravelBench integration & Not started; license check in progress \\
+Metrics: success, retention, preservation, cost & Done; plus exact
+minimum-edit scoring, budget caps, forced-mistake recovery \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Literature review}
+\label{sec:litreview}
+
+\textbf{Benchmarks for tool-using travel agents.}
+TravelPlanner~\citep{xie2024travelplanner} provides public databases, tools,
+and annotated plans for one-shot itinerary generation with commonsense and
+hard constraints, and shows that strong LLM agents often fail budget and
+constraint checks. Flex-TravelPlanner~\citep{oh2025flextravelplanner} makes
+the setting multi-turn: constraints are revealed over several queries, and
+models frequently satisfy a new preference while silently breaking an
+earlier global constraint such as budget. Our benchmark deliberately goes
+beyond constraint \emph{addition}: we generate add, delete, replace, and
+reprioritize updates over seven targets, with infeasible updates mixed in,
+so the correct action distribution includes asking and keeping silent, not
+only repairing. Both works score final plans; we additionally score the
+\emph{process}---how many slots were edited beyond the exact minimum---which
+is the quantity our coordinator is meant to control.
+
+\textbf{Multi-agent LLM systems.} General frameworks such as
+AutoGen~\citep{wu2023autogen} and MetaGPT~\citep{hong2024metagpt} organize
+LLMs into conversational or role-specialized societies, and
+ReAct~\citep{yao2023react} interleaves reasoning with tool calls for a
+single agent. For travel specifically, ATLAS~\citep{choi2025atlas}
+decomposes planning into constraint-aware collaborating agents, and
+HiMAP-Travel~\citep{bui2026himaptravel} uses hierarchical multi-agent
+planning for long constrained itineraries. These systems fix the
+\emph{workflow} by hand: which agent acts, in what order, and when to redo
+work. TaskFlow-Travel asks the complementary question---given a modular
+agent team, can the \emph{dispatch decision} itself be learned from an
+expert's demonstrations, and does that beat hand-written dispatch at equal
+or lower cost?
+
+\textbf{Imitation learning.} Behavior cloning from expert demonstrations is
+the classic approach~\citep{pomerleau1991alvinn}, but errors compound over
+long horizons: a policy that strays from the expert's state distribution has
+no supervision for recovery~\citep{ross2010efficient}. DAgger fixes this by
+aggregating expert corrections on states visited by the
+learner~\citep{ross2011dagger}. Recent work applies the same recipe to LLM
+agents, using environment feedback and expert relabeling to improve
+tool-using policies~\citep{zhang2026earlyexperience}. Our coordinator is a
+compact instantiation of exactly this recipe---one MLP policy over a
+compact state encoding, trained with BC, then trajectory augmentation, then
+DAgger with the scripted expert as teacher---and our forced-mistake
+evaluation measures the compounding-error concern directly
+(Section~\ref{sec:results}). This is also the risk the pre-proposal review
+asked us to mitigate, and the mitigation is now trained, evaluated, and
+ablated.
+
+\textbf{Plan repair versus replanning.} Classical planning distinguishes
+repairing a plan from recomputing one, and shows that minimizing change to a
+validated plan is itself a criterion worth
+optimizing~\citep{fox2006planstability}. We transport this concern to LLM
+agent systems: regenerating an itinerary is not only expensive (about
+$5.8\times$ the LLM calls of a targeted repair in our cost model) but also
+discards choices the user has already accepted. Our edit-optimality metric
+makes ``unnecessary change'' measurable, in the spirit of plan stability,
+for conversational replanning.
+
+\textbf{Positioning.} To our knowledge, no prior work learns the
+coordination policy of a multi-agent travel planner under genuine constraint
+\emph{revision} (including deletions and reprioritization). The closest
+systems hand-code dispatch; the closest learning work targets one-shot
+tool-use policies rather than repair-versus-rebuild decisions across turns.
+
+\section{Initial results}
+\label{sec:results}
+
+\textbf{Setup.} All numbers are offline: the tracker is rule-based, the
+component agents are deterministic searches, and per-action LLM calls/tokens
+come from a fixed cost model (global rebuild $\approx$ 4 calls/6{,}000
+tokens; one local repair 1 call/1{,}500). This keeps the comparison between
+coordinators meaningful---rebuilding really is more work than swapping a
+hotel---but absolute costs must be confirmed with a real model (our P0
+task). The main benchmark is the v0 test split (276 episodes / 689 turns);
+learned systems are mean$\pm$std over 3 training seeds. \emph{Excess edits}
+counts slot changes beyond the exact minimum any valid repair needs;
+\emph{edit-optimal preservation} is $1-\text{excess}/(13-\text{minimum})$,
+computed by an exact solver after the run.
+
+\begin{table*}[t]
+\centering
+\caption{Main benchmark (v0 test: 276 episodes / 689 turns). Learned systems:
+mean$\pm$std over 3 seeds.}
+\label{tab:main}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{System} & \textbf{Final pass} & \textbf{Revision succ.} &
+\textbf{Excess edits/turn} & \textbf{Preserv.\ \%} & \textbf{LLM calls/turn} \\
+\midrule
+Always-Global (sampled) & 100.0 & 100.0 & 8.22 & 30.0 & 4.19 \\
+Always-Global (deterministic) & 100.0 & 100.0 & 1.52 & 86.9 & 4.19 \\
+Static rules & 100.0 & 100.0 & 1.21 & 89.0 & 0.95 \\
+Static rules (cost-aware) & 100.0 & 100.0 & 1.16 & 89.7 & 0.84 \\
+BC & 99.4\,$\pm$\,0.3 & 99.7\,$\pm$\,0.2 & 1.16 & 89.6 & 0.72 \\
+BC + augmentation & \textbf{100.0} & \textbf{100.0} & 1.16 & 89.6 & 0.72 \\
+BC + DAgger (3) & 99.5\,$\pm$\,0.3 & 99.6\,$\pm$\,0.3 & 1.17 & 89.6 & 0.72 \\
+BC + aug + DAgger (3) & 99.8\,$\pm$\,0.2 & 99.6\,$\pm$\,0.1 & 1.17 & 89.5 & 0.72 \\
+Scripted expert (deterministic) & 100.0 & 100.0 & 1.16 & 89.7 & 0.71 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/error_vs_step.png}
+\caption{Disagreement with the scripted expert's action choices, by
+within-turn action step (left) and by turn index (right). Turn 4 exists only
+in the test split, so it is held-out horizon length. Plain BC drifts
+furthest from the expert as steps and turns accumulate---the compounding
+trajectory error the pre-proposal review asked us to mitigate---while the
+augmented variants stay close to the expert throughout.}
+\label{fig:errorstep}
+\end{figure*}
+
+\textbf{Main benchmark (Table~\ref{tab:main}).} Every system except plain BC
+reaches essentially full success, so the interesting axes are efficiency and
+stability. The learned coordinator imitates the expert closely: identical
+excess edits (1.16--1.17), preservation within half a point, and 0.72 calls
+per turn versus the expert's 0.71. Against the cost-aware static baseline
+it uses ${\sim}14\%$ fewer calls (0.72 vs.\ 0.84) at 99.6--100\% success.
+Always-regenerate spends $5.8\times$ the calls of the learned coordinator;
+with sampled regeneration (our stand-in for an LLM rebuilding from scratch)
+it also churns 8.2 slots per turn. The deterministic control shows this
+instability is a modeling choice, which is why all real-LLM claims wait for
+the first live run (Section~\ref{sec:plan}). Across DAgger iteration counts
+(1/2/3), final pass is 99.6$\pm$0.5 / 100.0 / 99.5$\pm$0.3: more DAgger
+iterations do not monotonically help on this benchmark, so our default
+system fixes three iterations and leans on augmentation instead.
+
+\begin{table}[t]
+\centering
+\caption{Revision success (\%) under a matched per-turn LLM-call cap.}
+\label{tab:capped}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{System} & \textbf{Cap 1} & \textbf{Cap 2} \\
+\midrule
+Static rules & 72.4 & 98.1 \\
+Static rules (cost-aware) & 79.7 & 100.0 \\
+BC & 97.9 & 99.6 \\
+BC + augmentation & 97.8 & 99.8 \\
+BC + DAgger (3) & 97.7 & 99.6 \\
+BC + aug + DAgger (3) & 97.6 & 99.5 \\
+Scripted expert & 98.5 & 100.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Tight budgets are where learning clearly helps
+(Table~\ref{tab:capped}).} Capped at one LLM call per turn, all learned
+variants hold 97.6--97.9\% revision success while the cost-aware rules drop
+to 79.7\% and plain rules to 72.4\%. With two calls the rule-based systems
+catch up (98--100\%). The learned coordinator's advantage is exactly the
+cheap-information regime: it knows \emph{where} to spend the single call.
+
+\begin{table*}[t]
+\centering
+\caption{Multi-component budget cuts (test family, 138 episodes): one-turn
+cuts requiring 1--3 component changes, from an approved expensive itinerary.}
+\label{tab:multi}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{System} & \textbf{Success} & \textbf{Excess edits} &
+\textbf{Global rebuilds} & \textbf{LLM calls/turn} \\
+\midrule
+Always-Global (deterministic) & 100.0 & 4.71 & 100\% & 4.08 \\
+Static rules & 100.0 & 5.94 & 75\% & 4.09 \\
+Static rules (cost-aware) & 100.0 & 1.03 & 0\% & 2.01 \\
+BC & 98.8\,$\pm$\,0.9 & 0.79 & 0\% & 2.06 \\
+BC + aug + DAgger (3) & 100.0 & \textbf{0.82} & 0\% & 2.02 \\
+Scripted expert & 100.0 & 0.78 & 0\% & 2.01 \\
+\midrule
+\multicolumn{5}{@{}l@{}}{\emph{Excess edits by difficulty (learned vs.\ cost-aware rules): 1 component 0.13 vs.\ 0.33;}}\\
+\multicolumn{5}{@{}l@{}}{\emph{2 components 0.41 vs.\ 0.81; 3 components 1.79 vs.\ 1.79. All systems at 100\% success per level.}}\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\textbf{Multi-component cuts (Table~\ref{tab:multi}).} When a budget cut
+must ripple through two or three components at once, the original static
+rules fail badly on stability (5.9 excess edits, 75\% unnecessary global
+rebuilds). Against the \emph{stronger} cost-aware baseline the learned
+coordinator is about 20\% better on excess edits (0.82 vs.\ 1.03) at the
+same success and call count, and its advantage grows with difficulty on
+1--2-component cuts. An honesty note: our first comparison used the weak
+static baseline and exaggerated the gap; we added cost-aware rules after an
+internal review, and report both from now on.
+
+\begin{table*}[t]
+\centering
+\caption{Plan to the final report. Owner sub-teams in parentheses.}
+\label{tab:plan}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.13\textwidth}>{\raggedright\arraybackslash}p{0.79\textwidth}@{}}
+\toprule
+\textbf{Window} & \textbf{Work} \\
+\midrule
+Nov 15--22 &
+\textbf{H4, first real-LLM run} (agents): smoke-run one validation episode,
+iterate prompts (validation only, test frozen), then a 30-episode validation
+run; accept only non-degraded runs (fallback $<$5\%); report measured tokens
+alongside simulated cost. \textbf{Single-agent LLM baseline} (agents): one
+LLM call per turn returning the full plan as JSON, verifier-checked, no
+silent fallback. \textbf{Freeze test-v2} (bench): non-budget multi-component
+updates and multi-turn sequences, developed on train/val and frozen before
+any tuning. \\
+Nov 22--29 &
+Full LLM evaluation including the single-agent baseline and the capped-budget
+protocol; LLM-teacher comparison (learning) if time permits; host the
+interactive app online (eval) and record the demo walkthrough; poster and
+rehearsal (everyone). \\
+Nov 30 & Poster and demo session. \\
+Nov 30--Dec 7 &
+Final report (research-paper structure), contribution statement, peer
+evaluation. \textbf{Public release} (bench), as the pre-proposal review
+suggested: dataset card and datasheet for the evolving-constraint tasks,
+the verifier, and the committed artifacts, citing TravelPlanner (CC BY 4.0). \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\textbf{Robustness and compounding error.} This is the risk the
+pre-proposal review flagged for behavior cloning, so we evaluate it three
+ways. \emph{Forced-mistake recovery} (164 episodes where the forced first
+action leaves the plan broken): plain BC recovers on 90.5--95.9\% of turns
+and DAgger alone varies by mistake type (82.8--100\%), while BC+augmentation
+recovers 99.1--100\% of the time---augmentation is the reliable mitigation,
+with or without DAgger. \emph{Held-out longer horizons}: BC handles 98.6\%
+of held-out 4th turns (training never exceeds 3), and BC+aug+DAgger 98.6\%
+(Figure~\ref{fig:errorstep} tracks disagreement with the expert as episodes
+progress).
+\emph{Clarification}: on infeasible updates, recall is 99.0$\pm$0.4 for BC
+and 100.0 for BC+augmentation at 99.5--100\% precision---asking is learned,
+not hard-coded. Per update type, all methods sit at 98--100\% success;
+sampled always-global keeps only 21--33\% of unaffected slots, versus
+94--100\% for the learned and rule-based systems. Figure~\ref{fig:pareto}
+summarizes the success--cost trade-off.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\columnwidth]{figures/pareto.png}
+\caption{Revision success versus simulated LLM calls per turn (main test
+split). The x-axis is broken (always-global sits at 4.19 calls) and the
+y-axis is zoomed to $[99.3, 100.1]$; legend entries give each system's share
+of unaffected slots preserved. The learned coordinators sit at the expert's
+operating point at lower cost than the static baselines; always-global pays
+$5.8\times$ the calls.}
+\label{fig:pareto}
+\end{figure}
+
+\textbf{Validity and limitations.} Four caveats frame every number above.
+(1)~All results are offline; LLM costs are simulated, and the LLM paths have
+run only against a fake backend with adversarial stubs.
+(2)~The instability of global regeneration is simulated (sampled near-best
+choices); its deterministic control bounds the effect (30.0\% vs.\ 86.9\%
+preservation). (3)~Difficulty levels of the multi-component family are
+chosen with the same scripted expert that provides training labels, so those
+results measure imitation of its decision boundary, not optimality.
+(4)~``Unseen phrasing'' uses a second handwritten template set, so it tests
+template compatibility, not paraphrase robustness. Scope: 3-day single-city
+trips; TravelPlanner hides test constraints, so those trips' starting
+budgets (1.2--1.7$\times$ the cheapest plan) and requirements are sampled.
+Against the proposal's rejection criterion, the hypothesis currently
+\emph{holds} under tight call budgets and on edit efficiency for
+multi-component cuts, and \emph{does not yet hold} without a cap against the
+cost-aware rules, where success is equal or slightly lower at modestly fewer
+calls; all of this still needs confirming with real LLM agents.
+
+\section{Updated plan for the remainder}
+\label{sec:plan}
+
+Deadlines anchor the plan: poster/demo session Nov 30, final report Dec 7.
+The sub-teams are bench (data/verifier), agents (planners/LLM), learning
+(encoder/BC/DAgger), eval (metrics/CI/figures).
+
+\textbf{Decisions and risks.} (1)~Offline numbers remain the primary results
+until real-LLM numbers land; if prompt iteration stalls on validation, we
+report the offline result with the simulated-cost caveat rather than a
+degraded LLM run. (2)~FlexTravelBench, multi-city trips, LLM paraphrases,
+and ``add a traveler''/date changes are stretch goals, taken only if H4 and
+the baseline land early---each is scoped in the repo's task board.
+(3)~The action mask forbidding repeated re-plans must be revisited with real
+LLMs, whose retries are not idempotent. (4)~Cost control: full LLM
+evaluations run hundreds of messages; we cap spending at the provider and
+cache replies (caches are git-ignored). Success at the final report:
+measured (not simulated) cost for every system in Table~\ref{tab:main}, the
+promised three-system comparison complete, the dataset and verifier
+released, and a frozen second test set used only to produce the final
+numbers, never for tuning.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
